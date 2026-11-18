@@ -17,6 +17,17 @@ uv pip check --python .venv/bin/python
 
 修改源码后重新安装。样例应报告 `window_count=3`、`exceeded_count=1`，超限窗口为 `/records`，使用量 7、上限 5。本仓不共享其他仓环境，不依赖Docker、外部账号或持续服务。
 
+## 共享容量保留与申诉模式
+
+`--mode retention`（默认 `audit` 行为与 v1 契约完全不变）回答在 principal 与 route 两类共享配额同时约束下应保留哪些请求，以及人工申诉某条请求必须保留时的替换与损失。输入/输出契约、求解结构与申诉隔离保证见 [数据契约](docs/contract.md)。
+
+```sh
+PYTHONPATH=src python3 -m api_quota_audit.cli \
+  --mode retention --source fixtures/retention.json --output run/retention.json
+```
+
+输出 `schema_version=2`，`result` 含 `baseline`、逐项 `appeals` 和 `deduplicated_request_count`；三级目标为保留数、priority 总和、按 id 字典序。生产求解为多项式时间的最小费用最大流，不做子集枚举、不接外部优化器；每份申诉独立重求、互不污染。
+
 输入JSON最多8MB，拒绝重复键、非有限数值和未定义字段；源字节SHA256随结果保留。
 输出是可独立读取的JSON；成功后原子替换，输入/计算失败退出2并保留旧报告。
 输入和输出不得相同，输出符号链接拒绝。单操作者批处理，不承诺并发发布或断电恢复。

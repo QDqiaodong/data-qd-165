@@ -1,0 +1,16 @@
+{
+  "principal_policies": [
+    {"principal": "client-a", "window_seconds": 3600, "limit": 2}
+  ],
+  "route_policies": [
+    {"route": "/read", "window_seconds": 3600, "limit": 1},
+    {"route": "/write", "window_seconds": 3600, "limit": 1}
+  ],
+  "requests": [
+    {"id": "r1", "principal": "client-a", "route": "/read",  "at": "2026-01-01T00:00:00Z", "priority": 10},
+    {"id": "r2", "principal": "client-a", "route": "/read",  "at": "2026-01-01T00:01:00Z", "priority": 10},
+    {"id": "r3", "principal": "client-a", "route": "/write", "at": "2026-01-01T00:02:00Z", "priority": 10},
+    {"id": "r4", "principal": "client-a", "route": "/write", "at": "2026-01-01T00:03:00+00:00", "priority": 10}
+  ],
+  "appeals": ["r2", "r4"]
+}
