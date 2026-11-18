@@ -64,3 +64,15 @@ class ApiQuotaTests(unittest.TestCase):
         data = {'policies': [{'id': 'p', 'principal': 'a', 'route': '/', 'window_seconds': 60, 'limit': 5}],
                 'events': [{'id': 'e', 'principal': 'a', 'route': '/', 'at': '1969-12-31T23:59:59Z', 'units': 1}]}
         self.assertEqual(analyze(data)['windows'][0]['window_start_utc'], '1969-12-31T23:59:00Z')
+
+    def test_subsecond_conflicting_duplicate_is_rejected(self):
+        data = fixture()
+        data['events'][0]['at'] = '2026-01-01T00:59:00.100000Z'
+        data['events'].append(dict(data['events'][0], at='2026-01-01T00:59:00.200000Z'))
+        with self.assertRaisesRegex(ValueError, 'conflicting'):
+            analyze(data)
+
+    def test_subsecond_before_epoch_uses_previous_window(self):
+        data = {'policies': [{'id': 'p', 'principal': 'a', 'route': '/', 'window_seconds': 60, 'limit': 5}],
+                'events': [{'id': 'e', 'principal': 'a', 'route': '/', 'at': '1969-12-31T23:59:59.999999Z', 'units': 1}]}
+        self.assertEqual(analyze(data)['windows'][0]['window_start_utc'], '1969-12-31T23:59:00Z')

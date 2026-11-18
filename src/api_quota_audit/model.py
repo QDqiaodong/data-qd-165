@@ -12,7 +12,7 @@ def instant(value):
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError('timestamp must include UTC offset')
     delta = parsed.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
-    return delta.days * 86400 + delta.seconds
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
 def analyze(data):
@@ -41,7 +41,7 @@ def analyze(data):
         if scope not in policies:
             raise ValueError('event has no exact principal-route policy')
         policy = policies[scope]
-        start = timestamp // policy['window'] * policy['window']
+        start = timestamp // (policy['window'] * 1_000_000) * policy['window']
         key = (principal, route, start)
         entry = windows.setdefault(key, {'policy_id': policy['id'], 'window_seconds': policy['window'], 'limit': policy['limit'], 'used': 0, 'event_ids': []})
         entry['used'] += units
