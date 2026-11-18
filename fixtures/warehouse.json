@@ -1,0 +1,13 @@
+{
+  "batch_id": "initial",
+  "policy_revisions": [
+    {"policy_id": "read-hourly", "revision": 1, "deleted": false, "principal": "client-A", "route": "/records", "valid_from": "2026-01-01T00:00:00Z", "valid_to": null, "window_seconds": 3600, "limit": 5},
+    {"policy_id": "write-hourly", "revision": 1, "deleted": false, "principal": "client-A", "route": "/updates", "valid_from": "2026-01-01T00:00:00Z", "valid_to": null, "window_seconds": 3600, "limit": 10}
+  ],
+  "event_revisions": [
+    {"event_id": "e1", "revision": 1, "deleted": false, "principal": "client-A", "route": "/records", "at": "2026-01-01T00:59:00Z", "units": 3},
+    {"event_id": "e2", "revision": 1, "deleted": false, "principal": "client-A", "route": "/records", "at": "2026-01-01T00:59:30Z", "units": 4},
+    {"event_id": "e3", "revision": 1, "deleted": false, "principal": "client-A", "route": "/records", "at": "2026-01-01T01:00:00Z", "units": 1},
+    {"event_id": "e4", "revision": 1, "deleted": false, "principal": "client-A", "route": "/updates", "at": "2026-01-01T00:59:00+00:00", "units": 6}
+  ]
+}

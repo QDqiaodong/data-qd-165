@@ -59,4 +59,17 @@ PYTHONPATH=src python3 -m api_quota_audit.cli \
 
 `python -m api_quota_audit.ledger` 是同等入口。`init` 创建空库（不覆盖，stdout 为 `schema_version=1` 的 JSON）；`apply` 在一个事务内执行最多 500 个操作，成功 stdout 严格为 `receipts` 数组对象；`report` 导出已提交状态的只读快照，stdout 与写入文件逐字节相同。业务/输入错误退出 2、只写 stderr，不隐式建库、拒绝未知 schema 与符号链接 DB，报告不得与 DB 同一文件。仅用标准库 `sqlite3`，不连外部服务。
 
+## 可追溯用量事实仓（`api-usage-warehouse`）
+
+新增的独立命令把 API 用量事件与配额策略各自保存成不可覆盖的完整版本/撤回版本，每个成功批次分配一个连续知识序号，使运营能重现「当时已知的配额报告」。历史查询有两个独立截止：`--max-seq` 先选每个身份在知识截止内的最高版本（最新版本已撤回即视为不存在，绝不回退旧版本），再按 `--event-before` 的严格 `at <` 截止筛事件；策略按事件头的历史生效段归属，同一 epoch 窗口内不同策略版本各自使用自己的完整 `limit`。
+
+```sh
+.venv/bin/api-usage-warehouse create --db run/warehouse.db
+.venv/bin/api-usage-warehouse ingest --db run/warehouse.db --source fixtures/warehouse.json
+.venv/bin/api-usage-warehouse query  --db run/warehouse.db \
+  --max-seq 1 --event-before 2026-01-01T02:00:00Z --output run/warehouse-report.json
+```
+
+`python -m api_quota_audit.warehouse` 是同等入口；Python 调用 `create_database`、`ingest_batch`、`query_warehouse`。`create` 不覆盖已有库，stdout 为 `{"schema_version":1}`；`ingest` 在一个事务内校验 revision 连续性、策略区间不重叠及每条有效事件唯一策略，成功后 stdout 为冻结的批次 receipt；`query` 从只读一致快照发布双截止报告，stdout 与输出文件逐字节相同。业务/输入错误退出 2、只写 stderr，失败批次不留下序号或版本；不隐式建库、拒绝未知 schema 与符号链接 DB、拒绝输出与 DB 同文件。历史存储方案与隔离性说明见 [数据契约](docs/contract.md) 第 5 节。
+
 

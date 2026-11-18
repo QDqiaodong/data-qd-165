@@ -1,6 +1,6 @@
 # API 配额审计数据契约
 
-本工具有三种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。此外提供一个独立的本地持久化预付额度台账命令（见第 4 节），只使用 Python 标准库 `sqlite3` 与本地文件，不连接任何外部服务，也不改变上述三种模式的输入与结果。
+本工具有三种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。此外提供两个独立的本地 SQLite 命令：持久化预付额度台账（见第 4 节）与可追溯用量事实仓（见第 5 节）。两者都只使用 Python 标准库 `sqlite3` 与本地文件，不连接任何外部服务，也不改变上述三种模式的输入与结果；事实仓与台账互不读取或改写对方的存储。
 
 ## 1. 默认固定窗口用量审计（schema_version=1，`--mode audit`，可省略）
 
@@ -223,3 +223,82 @@ granted == available + held + consumed + retired
 
 任一新操作失败时，整批此前的新 grant、hold 变化、到期退役、时钟及凭据均不留下，此前已存在的凭据不变。成功提交后关闭并重开数据库必须重现完全相同状态。测试逐批直接验算每个 lot 的守恒与每个 hold 的来源，并覆盖失败后持久化文件状态、无效输入/未知 schema 不损坏旧库或旧报告。仅要求单机本地 SQLite 事务，不要求网络服务、多机分布式协议或断电文件系统模拟。既有三种模式的输入与结果保持不变。
 
+
+## 5. 可追溯用量事实仓（`api-usage-warehouse` / `python -m api_quota_audit.warehouse`）
+
+新增的独立命令，把「事件正常/撤回版本」与「配额策略正常/撤回版本」按知识序号追加式保存在单个 SQLite 文件中，使运营能够重现「当时已知的配额报告」。它复用受限 JSON 读取（8MB、拒绝重复键/非有限数值）、`ident` 与精确 UTC 微秒 `instant`，不读取、不改变 audit/retention/reconcile 输入，也不读取或改变 grant/hold/核销与预付余额。三条子命令：
+
+```sh
+api-usage-warehouse create --db PATH
+api-usage-warehouse ingest --db PATH --source JSON
+api-usage-warehouse query  --db PATH --max-seq N --event-before ISO --output JSON
+```
+
+对应 Python 函数为 `warehouse.create_database`、`warehouse.ingest_batch`、`warehouse.query_warehouse`（另可直接调用 `warehouse.build_report` 获得报告对象而不写文件）。
+
+* `create` 只创建新库，已存在（含符号链接、悬空符号链接）即拒绝；成功时 stdout 严格为 `{"schema_version":1}` 的 JSON。
+* `ingest` 在一个事务里提交一个批次，成功时 stdout 严格为批次 receipt 对象。
+* `query` 从一个只读一致快照计算报告；成功时 stdout 与写入 `--output` 的文件逐字节相同。
+* `ingest` / `query` 都不隐式建库（库不存在即失败、不产生文件），遇到未知 schema 一律拒绝；数据库路径为符号链接时拒绝。
+* 业务/输入错误退出码 2，只写 stderr，不打印成功 JSON；失败事务回滚，不留下新序号、版本或 receipt。`query` 非法参数（`max_seq` 越界、非法时间字符串）或文件错误同样退出 2，旧输出文件保持不变。
+* 只要求单机本地 SQLite；DB 提交与报告文件之间不做跨资源原子提交。
+
+### 5.1 入仓输入与规范身份
+
+顶层严格为 `batch_id`、`event_revisions`、`policy_revisions`，缺字段或多字段整份失败。`batch_id` 及全部业务 id/scope 沿用 `ident`；两个数组各最多 2000 行、可空。`event_id` 与 `policy_id` 各自跨批全库唯一身份（主键分别为 `(event_id, revision)` 与 `(policy_id, revision)`），两个种类可以同名。
+
+* 事件正常版本严格含 `event_id`、`revision`、`deleted=false`、`principal`、`route`、`at`、`units`；撤回版本严格含 `event_id`、`revision`、`deleted=true`。`deleted` 必须是 JSON 布尔。`units` 为 1..1,000,000,000 的整数，拒绝 bool/浮点。
+* 策略正常版本严格含 `policy_id`、`revision`、`deleted=false`、`principal`、`route`、`valid_from`、`valid_to`、`window_seconds`、`limit`；撤回版本严格含 `policy_id`、`revision`、`deleted=true`。`valid_to` 可为 `null` 表示正无穷，否则要求 `valid_from < valid_to`（秒级相等也不行）。`window_seconds` 为 1..31,536,000 的整数，`limit` 为 1..10^12 的整数，均拒绝 bool/浮点。
+* 时间统一沿用 `instant` 语义：显式时区、精确到微秒、等价偏移视为同一 UTC 时刻，不截秒判等。批次不读取系统时钟，也不禁止更早业务时刻。
+* `revision` 是 1 开始的正整数。身份首次出现必须是非 `deleted` 的 `revision=1`；之后严格连续（同批可有同身份多个连续 revision，也可由后续批次接续），不能跳号或覆盖；同一批次内重复同一 `(id, revision)` 即错误；已存在 revision 即使内容相同也不能由另一个 `batch_id` 再次写入。撤回已撤回身份错误（重复撤回），恢复必须用撤回之后的下一完整非 `deleted` 版本。
+* 两个数组的排列不影响结果：解析后按各自的 `(id, revision)` 排序。规范批次身份 = `batch_id` + 按 `(id, revision)` 排序的两个版本数组 + 全部严格字段与值（时间转 UTC 微秒）；同 `batch_id` 内容冲突错误。
+
+### 5.2 序号、receipt 与幂等重试
+
+每个成功的新 `batch_id` 占一个连续 `seq`（初始空库无批次；首批为 1，其后 +1），空批次同样占号；同批所有 revision 归属同一 `seq`。receipt 严格含 `batch_id`、`seq`、`event_revision_count`、`policy_revision_count`，两个计数是该次成功写入的行数（含撤回版本），随数据库持久保存。
+
+完全相同规范内容的重试直接返回保存的原 receipt：不增 `seq`、不重验当前头（因此后续已提交的新 revision 不影响重试）。`batch_id` 已存在但规范内容不同则失败。
+
+### 5.3 最终状态校验
+
+新批次全部版本、序号与 receipt 写入后，**以批次结束状态**（而非临时中间状态）做一次校验，失败则整批回滚：
+
+1. 以新 `seq` 内每个身份的最高 revision 为头，排除 `deleted` 后，同 `(principal, route)` 所有策略的生效区间 `[valid_from, valid_to)` 不得重叠；端点相等（一个结束即另一个开始）允许；`valid_to=null` 视为到正无穷。
+2. 每条有效事件（当前全部有效事件，包括未在本批出现的身份）必须在其 `at` 匹配恰好一条同 `(principal, route)` 策略，否则整批失败。
+
+因此策略可以先于事件入仓；不要求无事件的 scope 有策略；策略撤回、更改 scope/区间与事件移位可以在同一批联动，校验只针对最终状态，不校验同批临时中间状态。
+
+### 5.4 双截止历史查询
+
+`max_seq` 为 0..当前最大 `seq` 的整数（类型必须是 int，越界错误）；`event_before` 沿用 `instant` 归一化为 UTC 微秒，严格取 `at < event_before`。选版顺序固定：
+
+1. **知识截止**：对每个事件/策略身份，先只考虑 `seq <= max_seq` 的版本并取最高 `revision`；若该头是 `deleted`，该身份在此快照中不存在（不得回退到更旧的版本）。
+2. **事件时间截止**：事件头版本选定之后才比较其 `at` 与 `event_before`。即使新头越过了截止，也绝不回退挑旧版本。
+3. 策略头版本选定后，按事件头的 `at` 匹配其历史生效段（`valid_from <= at < valid_to`），得到唯一归属。
+
+`seq=0` 结果为空。序列号上限、两类版本集合必须在同一只读事务（同一 SQLite 读快照）内读取。
+
+窗口仍由 UTC epoch 锚定 `[start,end)`，`start = floor(at_us / (window_seconds*1e6)) * window_seconds`（负 epoch 同样地板除），策略生效时刻不改变 epoch 锚点。每条筛入事件只贡献给唯一选定的 `(policy_id, revision)`；输出窗口按 `principal`、`route`、`policy_id`、`policy_revision`、`window_start_us` 区分，因此同一 epoch 窗口被两个策略版本分割时各自使用自己的完整 `limit`，不合并、不按时长折算；无事件不输出窗口。聚合数值（`used`、`over_by`、`exceeded`）与 UTC 字符串格式复用 `model.analyze` 抽取出的共享聚合函数（`breach`/`utc_text`/`window_start`），保留负 epoch 地板除、微秒边界和超限定义。
+
+报告严格含 `schema_version=1`、`max_seq`、`event_before_us`、`windows`、`window_count`、`exceeded_count`、`selected_event_count`。每个 window 严格含 `principal`、`route`、`policy_id`、`policy_revision`、`window_start_utc`、`window_end_utc`、`limit`、`used`、`over_by`、`exceeded`、`event_versions`；`event_versions` 为该窗口全部事件头的 `{event_id, revision}`，按 `event_id` 排序。`windows` 按上述区分键排序。报告不含易变生成时间，因此在追加后续 `seq` 后，用同一双截止重查的业务 JSON 完全一致。
+
+### 5.5 历史存储/投影方案与隔离性
+
+选择**查询时从不可变版本重建快照**，而不是为每个提交序号物化归属与窗口投影：
+
+* 两张版本表只做追加插入（`event_versions`、`policy_versions`），`(id, revision)` 是物理主键，`seq` 记录引入该版本的知识序号；`batches` 表按 `seq` 自增保存规范身份与冻结 receipt。任何提交都不会 `UPDATE`/`DELETE` 既有版本行。
+* 查询用 `revision = (SELECT MAX(revision) ... WHERE id = ? AND seq <= max_seq)` 在每个身份内选头，`seq <= max_seq` 条件同时进入外层与子查询，保证「先按知识截止选版本」；`deleted` 头随后被丢弃，早于时间截止的判断发生在其后。
+* 归属与聚合完全由所选版本在内存中重新计算，不读取任何「当前」状态或可变缓存。旧 `max_seq` 的查询只可能看到 `seq <= max_seq` 的行，因此后来的策略更正、事件移位或撤回不可能污染旧知识快照；同一 epoch 窗口的窗口键含 `policy_revision`，不同策略版本天然隔离（各自的 `limit` 独立，不合并）。
+
+该方案在查询时不依赖批内中间状态，也不会因跨批更正而失效；代价是查询需做一次全版本扫描（单机规模、每类最多 2000 行/批，可接受）。物化投影需要为每个新 `seq` 重写所有后续快照，且在迟到更正/撤回时更容易引入旧快照污染，故未采用。
+
+### 5.6 失败、重开与发布保护
+
+任一格式、revision、覆盖/重叠或事件无唯一策略错误，整批（两类版本、知识序号、批次凭据）在一个 SQLite 事务内回滚，无新 `seq`/版本/receipt，旧知识快照仍可读取。关库重开后可查询与重试所有已成功 `seq` 的 receipt。`query` 沿用已有原子写报告与输出符号链接拒绝，并拒绝 `output` 与 DB 指向同一文件（包括硬链接、`..`、符号链接等路径别名）；不得修改 DB（逻辑业务数据与序号保证不变，不承诺物理 DB 字节不变）。
+
+### 5.7 验收复现
+
+* `seq1`：`P1` 覆盖 A scope（`/x`），`E1` 在 `00:30`；`seq2` 把 E 的 `revision=2` 移到 B scope（`/y`）的 `01:30`，同批加入 B 策略。查询 `(seq1, 02:00)` 见 E1/P1；查询 `(seq2, 01:00)` 事件为空（不回退到 E1 旧版本）；查询 `(seq2, 02:00)` 见 E2/B。
+* 把 B 策略改为 `01:31` 开始会产生覆盖缺口 → 整批失败，不出现 `seq2`；此前全部可见历史与 receipt 在错误前后逐项相等（测试直接比对 `batches`/版本行与同双截止报告，不使用被测查询生成期望）。
+* 仅修订策略阈值/窗口长度而事件未改：新 `seq` 报表重归属与重算（`policy_revision`、窗口锚点、`limit`、超限随之改变），旧 `seq` 报告逐字节不变。
+* 测试覆盖：撤回后恢复、策略撤回与事件撤回同批、同身份同批多版本、相邻生效区间、一个 epoch 窗口内换策略（不合并限额）、负 epoch 及微秒边界、时区等价与数组乱序批次重试、已用 revision/冲突 batch、空批次、源 JSON 及输出保护、关库重开；并沿用原业务测试验证共享聚合未回归。

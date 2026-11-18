@@ -15,6 +15,30 @@ def instant(value):
     return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
+def window_start(timestamp_us, window_seconds):
+    """UTC epoch anchored window start in epoch seconds, flooring negative epochs."""
+    return timestamp_us // (window_seconds * 1_000_000) * window_seconds
+
+
+def utc_text(epoch_seconds):
+    return datetime.fromtimestamp(epoch_seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def breach(used, limit):
+    """Excess and breach flag, shared by every window report."""
+    return max(0, used - limit), used > limit
+
+
+def window_record(principal, route, policy_id, window_seconds, limit, start, used, event_ids):
+    """One observed window; shared by the audit and warehouse report paths."""
+    over_by, exceeded = breach(used, limit)
+    return {'principal': principal, 'route': route, 'window_start_utc': utc_text(start),
+            'window_end_utc': utc_text(start + window_seconds),
+            'policy_id': policy_id, 'limit': limit, 'used': used,
+            'over_by': over_by, 'exceeded': exceeded,
+            'event_ids': sorted(event_ids)}
+
+
 def analyze(data):
     require(data, 'policies events')
     policies = {}
@@ -41,17 +65,15 @@ def analyze(data):
         if scope not in policies:
             raise ValueError('event has no exact principal-route policy')
         policy = policies[scope]
-        start = timestamp // (policy['window'] * 1_000_000) * policy['window']
+        start = window_start(timestamp, policy['window'])
         key = (principal, route, start)
         entry = windows.setdefault(key, {'policy_id': policy['id'], 'window_seconds': policy['window'], 'limit': policy['limit'], 'used': 0, 'event_ids': []})
         entry['used'] += units
         entry['event_ids'].append(eid)
     output = []
     for (principal, route, start), value in sorted(windows.items()):
-        output.append({'principal': principal, 'route': route, 'window_start_utc': datetime.fromtimestamp(start, timezone.utc).isoformat().replace('+00:00', 'Z'),
-                       'window_end_utc': datetime.fromtimestamp(start + value['window_seconds'], timezone.utc).isoformat().replace('+00:00', 'Z'),
-                       'policy_id': value['policy_id'], 'limit': value['limit'], 'used': value['used'],
-                       'over_by': max(0, value['used'] - value['limit']), 'exceeded': value['used'] > value['limit'],
-                       'event_ids': sorted(value['event_ids'])})
+        output.append(window_record(principal, route, value['policy_id'],
+                                    value['window_seconds'], value['limit'], start,
+                                    value['used'], value['event_ids']))
     return {'windows': output, 'window_count': len(output), 'exceeded_count': sum(x['exceeded'] for x in output),
             'deduplicated_event_count': len(events)}

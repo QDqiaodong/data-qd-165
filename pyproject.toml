@@ -10,5 +10,6 @@ dependencies = []
 [project.scripts]
 api-quota-audit = "api_quota_audit.cli:main"
 api-credit-ledger = "api_quota_audit.ledger:main"
+api-usage-warehouse = "api_quota_audit.warehouse:main"
 [tool.setuptools.packages.find]
 where = ["src"]
