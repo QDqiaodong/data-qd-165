@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "data-qd-165"
+version = "0.1.0"
+description = "Exact fixed-window API usage and quota breach attribution"
+requires-python = ">=3.11"
+dependencies = []
+[project.scripts]
+api-quota-audit = "api_quota_audit.cli:main"
+[tool.setuptools.packages.find]
+where = ["src"]

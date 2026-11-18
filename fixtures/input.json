@@ -1,0 +1,12 @@
+{
+  "policies": [
+    {"id": "read-hourly", "principal": "client-A", "route": "/records", "window_seconds": 3600, "limit": 5},
+    {"id": "write-hourly", "principal": "client-A", "route": "/updates", "window_seconds": 3600, "limit": 10}
+  ],
+  "events": [
+    {"id": "e1", "principal": "client-A", "route": "/records", "at": "2026-01-01T00:59:00Z", "units": 3},
+    {"id": "e2", "principal": "client-A", "route": "/records", "at": "2026-01-01T00:59:30Z", "units": 4},
+    {"id": "e3", "principal": "client-A", "route": "/records", "at": "2026-01-01T01:00:00Z", "units": 1},
+    {"id": "e4", "principal": "client-A", "route": "/updates", "at": "2026-01-01T00:59:00+00:00", "units": 6}
+  ]
+}
