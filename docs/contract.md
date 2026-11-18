@@ -1,6 +1,6 @@
 # API 配额审计数据契约
 
-本工具有两种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。
+本工具有三种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。
 
 ## 1. 默认固定窗口用量审计（schema_version=1，`--mode audit`，可省略）
 
@@ -82,3 +82,53 @@ source -> principal窗口 -> 请求in -> 请求out -> route窗口 -> sink
 ### 2.7 确定性与发布保证
 
 业务结果与输入排列、重复同一规范请求的位置、申诉排列均无关（内部统一按 Python 字符串序规范化）。`source_sha256` 始终反映源文件真实字节，源文件永不被修改。新模式复用受限 JSON 解析（拒绝重复键、非有限数值、未定义字段）、精确微秒时间与原子发布；任一输入错误退出码为 2，且已存在的旧报告保持不变。
+
+## 3. 区间计量证据对账（schema_version=3，`--mode reconcile`）
+
+### 3.1 输入
+
+顶层字段严格为 `timeline`、`max_slot_units`、`meters`、`invoices`、`queries`，缺字段或多字段整份失败。
+
+* `timeline`：2..161 个带显式时区的 ISO 时刻，沿用 instant 语义归一化为 UTC 微秒后须严格递增。设 `n = len(timeline) - 1`，slot `i` 是 `[timeline[i], timeline[i+1])`，`x[i]` 是其中未知的用量。
+* `max_slot_units`：1..1,000,000,000,000 的整数，所有 slot 的共同上界；不假定段内均匀速率。
+* `meters`：最多 1200 项，每项严格为 `id`、`start`、`end`、`lower`、`upper`，含义为 `lower <= sum(x[start:end]) <= upper`，`lower`/`upper` 为 0..1,000,000,000,000,000 且 `lower <= upper`。
+* `invoices`：最多 200 项，每项严格为 `id`、`start`、`end`、`units`，要求 `sum(x[start:end])` 恰为 `units`。
+* `queries`：最多 40 项，每项严格为 `id`、`start`、`end`，求该段用量范围。
+* 所有区间端点都是 timeline 索引，要求 `0 <= start < end <= n`，不插值。
+* `id` 沿用 ident 约束；各数组内部 id 唯一（重复即输入错误），不同种类可以同名。空 `meters`/`invoices`/`queries` 均合法。
+* 索引与所有业务整数拒绝 bool 与浮点（`True`/`False` 不等于 1/0）。
+* 先完整校验所有输入（含全部数组），再作任何业务判断；不会因为早发现计量矛盾而跳过非法账单或 query。
+
+### 3.2 联合业务契约
+
+未知量是一份同时满足全部证据的整数向量 `x[0..n)`。判断顺序固定：
+
+1. **计量相容**：全部 slot 边与 meter 约束（每条 `lower <= sum <= upper`）须由同一份用量分配满足；否则 `meter_conflict`。
+2. **账单批次裁决**：计量可行后，全部 invoice 必须**联合**成立；不是逐张检查数值范围，也不挑选可接受子集，任一联合矛盾即 `invoice_conflict`。
+3. **查询极值**：联合可行时，对每个 query 求精确最小/最大区间用量，**均基于全部 meters 加全部 invoices**，不是局部约束。每端都附带一份覆盖全部 `n` 个 slot 的整数分配作为见证；不同 query 及两端允许使用不同分配，每份见证独立满足全部约束（不能把各 slot 或 query 各自的最值拼成一条见证）。
+
+### 3.3 精确求解结构
+
+以累计量 `P[0] = 0`、`P[j] = sum(x[:j])` 表示，每条证据化为差分约束 `P[v] - P[u] <= w`：
+
+* meter `upper` 边 `start -> end` 权 `upper`，`lower` 边 `end -> start` 权 `-lower`；
+* invoice 同构，上下边权为 `units` 与 `-units`；
+* slot `i` 的 `upper` 边 `i -> i+1` 权 `max_slot_units`，`lower` 边 `i+1 -> i` 权 `0`。
+
+约束系统可行当且仅当有向图无负权环。实现先用 Bellman-Ford 在 slot+meter 子图上判定计量相容；把 invoice 边加入同一张图后再判一次，故任何新出现的负环必含 invoice 边。可行时用全点最短路（Floyd–Warshall，精确整数）得到：query `[start,end)` 的最大值 `dist(start,end)`，最小值 `-dist(end,start)`。同一距离向量 `dist(source, ·)` 本身满足所有约束边，其逐 slot 增量即为一份达到该极值的完整分配（`dist(source,v) <= dist(source,u)+w`）。全部算术保持精确整数，不使用浮点近似、逐单位枚举或外部求解器。
+
+### 3.4 输出与可核验证书
+
+报告外层严格为 `schema_version=3`、`mode="reconcile"`、`source_sha256`、`result`；`result` 严格为 `status`、`ranges`、`certificate`。
+
+* `status` ∈ `feasible` / `meter_conflict` / `invoice_conflict`；两个 conflict 是合法业务报告，命令成功退出 0。
+* `feasible`：`certificate` 为空数组；`ranges` 按 query id 排序，每项严格为 `id`、`min_units`、`max_units`、`min_allocation`、`max_allocation`。每份 allocation 是长度 `n` 的整数数组，依次给出全部 slot 用量；即使最小等于最大，两份完整数组也给出。
+* 两个 conflict：`ranges` 为空数组，`certificate` 非空。
+* `certificate` 是按行走顺序排列的原始约束边数组，每边严格含 `kind`、`ref`、`side`、`from`、`to`、`weight`：`kind` 为 `meter`/`invoice`/`slot`，`ref` 为原 id（slot 用 `i` 的十进制字符串），`side` 为 `upper`/`lower`，其余值须与上述原始边完全相符。连续边首尾相接，末边终点等于首边起点，所有 `weight` 之和严格小于 0，边数最多 `n+1`。
+* 证书不含闭包捷径边，也不含虚构超级源边：Bellman-Ford 以全零距离起步（等价于虚拟源但不物化其边），末轮仍可松弛的节点沿前驱链回溯即得原始边构成的简单负环。
+* `meter_conflict` 证书只引用 meter 与 slot 边；`invoice_conflict` 证书可引用全部来源并至少含一条 invoice 边（因计量子图已被证明无负环）。
+* 证书与 allocation 都是可独立复算的真实见证，不是不可复现的错误字符串。
+
+### 3.5 确定性与发布保证
+
+结果与源数组排列无关（内部按 id 排序）。沿用原输入字节 SHA256、同路径拒绝、输出符号链接拒绝及原子写入；格式/字段/范围等输入错误退出 2 且保留原目标文件。既有 `audit`（schema_version=1）与 `retention`（schema_version=2）入口及结果保持不变，本模式仅复用 instant 的精确 UTC 时间与受限 JSON/原子发布。

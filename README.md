@@ -35,3 +35,15 @@ PYTHONPATH=src python3 -m api_quota_audit.cli \
 
 src/api_quota_audit/model.py 为业务模型，common.py 提供受限JSON及报告发布，
 cli.py 衔接数据链路。fixtures 为明确自制样例，代码与样例采用MIT许可。
+
+## 区间计量证据对账模式
+
+`--mode reconcile` 判断「采样系统的区间用量上下界」与「结算系统的区间精确账单」是否可能来自同一条整数用量时间序列，并在不可行时给出可逐边复核的负权环证书。输入/输出契约、求解结构与证书语义见 [数据契约](docs/contract.md) 第 3 节。
+
+```sh
+PYTHONPATH=src python3 -m api_quota_audit.cli \
+  --mode reconcile --source fixtures/reconcile.json --output run/reconcile.json
+```
+
+输出 `schema_version=3`，`result` 严格含 `status`、`ranges`、`certificate`。`status` 为 `feasible`、`meter_conflict` 或 `invoice_conflict`；两个冲突是合法业务报告，退出码仍为 0。可行时每个 query 给出精确最小/最大值与两份完整 slot 分配见证；冲突时给出原始约束边组成的闭合负权环，边数不超过 `n+1`。全部使用精确整数差分约束与全点最短路，不做浮点近似、逐单位枚举或外部求解器。
+

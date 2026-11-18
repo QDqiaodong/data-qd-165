@@ -3,19 +3,22 @@ import argparse, json, sys
 from pathlib import Path
 from .common import read, save
 from .model import analyze
+from .reconcile import reconcile_analyze
 from .retention import retention_analyze
 
 def run(source, mode):
     data,digest=read(source)
     if mode=='retention':
         return {'schema_version':2,'mode':'retention','source_sha256':digest,'result':retention_analyze(data)}
+    if mode=='reconcile':
+        return {'schema_version':3,'mode':'reconcile','source_sha256':digest,'result':reconcile_analyze(data)}
     return {'schema_version':1,'source_sha256':digest,'result':analyze(data)}
 
 def main():
     parser=argparse.ArgumentParser(description=DESCRIPTION)
     parser.add_argument('--source',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--mode',choices=('audit','retention'),default='audit')
+    parser.add_argument('--mode',choices=('audit','retention','reconcile'),default='audit')
     args=parser.parse_args()
     try:
         if args.source.resolve()==args.output.resolve():raise ValueError('input and output must differ')
