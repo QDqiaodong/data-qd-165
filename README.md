@@ -34,7 +34,7 @@ PYTHONPATH=src python3 -m api_quota_audit.cli \
 同输入重跑不累加。测试使用临时目录，运行产物在忽略的run/。
 
 src/api_quota_audit/model.py 为业务模型，common.py 提供受限JSON及报告发布，
-cli.py 衔接数据链路。fixtures 为明确自制样例，代码与样例采用MIT许可。
+cli.py 衔接数据链路，ledger.py 为独立的 SQLite 预付额度台账命令。fixtures 为明确自制样例，代码与样例采用MIT许可。
 
 ## 区间计量证据对账模式
 
@@ -46,4 +46,17 @@ PYTHONPATH=src python3 -m api_quota_audit.cli \
 ```
 
 输出 `schema_version=3`，`result` 严格含 `status`、`ranges`、`certificate`。`status` 为 `feasible`、`meter_conflict` 或 `invoice_conflict`；两个冲突是合法业务报告，退出码仍为 0。可行时每个 query 给出精确最小/最大值与两份完整 slot 分配见证；冲突时给出原始约束边组成的闭合负权环，边数不超过 `n+1`。全部使用精确整数差分约束与全点最短路，不做浮点近似、逐单位枚举或外部求解器。
+
+## 本地持久预付额度台账（`api-credit-ledger`）
+
+新增的独立命令把客户预付 units 存成一个 SQLite 文件中的持久台账：grant 批次有到期时刻，reserve 按 `(expires_at_us, lot_id)` 跨批次预占并冻结来源，commit 沿原分配顺序部分核销、cancel 全释放，批次到期或被 revoke 时依赖它的活跃 hold 整笔失效并释放其他来源。操作凭据按 `op_id` 冻结保存，可安全重试；报告在关闭重开后仍可复核每个批次的来源余额。输入/输出契约、存储结构、跨批次失效次序与事务边界见 [数据契约](docs/contract.md) 第 4 节。
+
+```sh
+.venv/bin/api-credit-ledger init   --db run/ledger.db
+.venv/bin/api-credit-ledger apply  --db run/ledger.db --source fixtures/ledger.json
+.venv/bin/api-credit-ledger report --db run/ledger.db --output run/ledger-report.json
+```
+
+`python -m api_quota_audit.ledger` 是同等入口。`init` 创建空库（不覆盖，stdout 为 `schema_version=1` 的 JSON）；`apply` 在一个事务内执行最多 500 个操作，成功 stdout 严格为 `receipts` 数组对象；`report` 导出已提交状态的只读快照，stdout 与写入文件逐字节相同。业务/输入错误退出 2、只写 stderr，不隐式建库、拒绝未知 schema 与符号链接 DB，报告不得与 DB 同一文件。仅用标准库 `sqlite3`，不连外部服务。
+
 

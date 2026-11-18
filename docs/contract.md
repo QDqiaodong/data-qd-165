@@ -1,6 +1,6 @@
 # API 配额审计数据契约
 
-本工具有三种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。
+本工具有三种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。此外提供一个独立的本地持久化预付额度台账命令（见第 4 节），只使用 Python 标准库 `sqlite3` 与本地文件，不连接任何外部服务，也不改变上述三种模式的输入与结果。
 
 ## 1. 默认固定窗口用量审计（schema_version=1，`--mode audit`，可省略）
 
@@ -132,3 +132,94 @@ source -> principal窗口 -> 请求in -> 请求out -> route窗口 -> sink
 ### 3.5 确定性与发布保证
 
 结果与源数组排列无关（内部按 id 排序）。沿用原输入字节 SHA256、同路径拒绝、输出符号链接拒绝及原子写入；格式/字段/范围等输入错误退出 2 且保留原目标文件。既有 `audit`（schema_version=1）与 `retention`（schema_version=2）入口及结果保持不变，本模式仅复用 instant 的精确 UTC 时间与受限 JSON/原子发布。
+
+## 4. 本地持久预付额度台账（`api-credit-ledger` / `python -m api_quota_audit.ledger`）
+
+新增的独立命令，把客户购买的预付 units 落成一个 SQLite 文件中的持久台账。它复用现有受限 JSON 读取（8MB、拒绝重复键/非有限数值）、`ident` 与精确 UTC 微秒 `instant`，但自身不读取任何 audit/retention/reconcile 输入，也不连外部服务。三条子命令：
+
+```sh
+api-credit-ledger init   --db PATH
+api-credit-ledger apply  --db PATH --source JSON
+api-credit-ledger report --db PATH --output JSON
+```
+
+* `init` 创建一个空数据库，绝不覆盖已存在文件（含符号链接）。成功时 stdout 严格为 `{"schema_version":1}` 的 JSON。
+* `apply` 在一个事务里执行一个操作批次。成功时 stdout 严格为 `{"receipts":[...]}` 的 JSON 对象，数组按输入 `operations` 顺序逐项给出凭据（重复项也逐项给出）。
+* `report` 导出一份已提交状态的只读快照；成功时 stdout 与写入 `--output` 的文件逐字节相同。
+* `apply` / `report` 都不会隐式初始化缺失数据库，遇到未知 schema 一律拒绝；数据库路径为符号链接时拒绝。
+* 业务/输入错误退出码 2，只写 stderr，不打印成功 JSON。调用者可凭 `op_id` 重试，无需依赖跨数据库提交或 stdout 的恰好一次投递。
+
+### 4.1 存储结构
+
+单个 SQLite 文件、六张业务表，全部路径走同一组 `PRAGMA foreign_keys`、`BEGIN IMMEDIATE` 事务：
+
+* `ledger_meta`：`schema_version='1'` 与 `clock_us`（初始为 NULL，之后为非负整数微秒）。
+* `lots`：每个批次一行，含 `lot_id`、`principal`、`granted`、`expires_at_us`、`status`（`active`/`expired`/`revoked`）、`available`、`retired`。`held`/`consumed` 由下述分派表在报告时汇总，不冗余存储。
+* `holds`：每个预占一行，含 `hold_id`、`principal`、`units`、`status`（`active`/`committed`/`cancelled`/`invalidated`）、`used_units`（仅 committed 非 NULL）。
+* `hold_allocations`：hold 的冻结原分配，`(hold_id, position)` 主键，按 position 保序，记录 `lot_id`、`units`。
+* `consumed_allocations`：committed hold 的实际核销来源，结构与上表相同，同样按原分配顺序的前缀。
+* `ops`：每个成功操作一行，`op_id` 主键 + 规范化身份 `canonical` + 冻结的 `receipt` JSON。重试直接读取该行。
+
+选择直接维护余额而不是追加分录：到期/撤销引起的跨批次失效需要在一个事务里同步修改多个 lot 的 `available`/`retired` 与 hold 状态，直接更新更便于在同一处断言守恒；`ops` 表天然承担了“原凭据冻结”的追加式记录职责。批次守恒在每个 lot 上恒为
+
+```
+granted == available + held + consumed + retired
+```
+
+其中 `held` 是所有 active hold 在其上的冻结分配之和，`consumed` 是所有 committed hold 实际核销之和；`retired` 只累计到期或撤销时该 lot 尚未消耗的余额，已核销部分永不退回。
+
+### 4.2 操作与校验
+
+`apply` 顶层严格为 `operations`（最多 500 项，可空）。每项都有 `op_id`、`kind`、`at`，并按 kind 严格只允许这些额外字段（任何额外字段都失败，即便 `op_id` 已存在）：
+
+| kind | 额外字段 |
+| --- | --- |
+| `grant` | `lot_id`、`principal`、`units`、`expires_at` |
+| `reserve` | `hold_id`、`principal`、`units` |
+| `commit` | `hold_id`、`used_units` |
+| `cancel` | `hold_id` |
+| `revoke` | `lot_id` |
+| `advance` | 无 |
+
+* `op_id`、`lot_id`、`hold_id`、`principal` 沿用 `ident`；`op_id` 全库唯一，`lot_id` 与 `hold_id` 各自全库唯一且终态后不复用。
+* `at`/`expires_at` 用 `instant` 归一化为精确 UTC 微秒；无时区或非法时间失败。`expires_at > at`。
+* `units` 为 1..10^12 的整数；`used_units` 为 0..该 hold 预占量 的整数。两者都拒绝 bool 与浮点。
+* `grant` 要求 `expires_at > at`；`reserve` 只能用同 principal 且尚未失效的 active lot，可用量不足则整批失败，不部分成功。
+* 未知 id、重复业务 id、对非 active hold 执行 `commit`/`cancel`、对非 active lot 执行 `revoke` 均失败。
+
+### 4.3 逻辑时钟与生命周期次序
+
+每个**新**操作先推进不倒退的逻辑时钟，再处理全部到期批次，最后执行业务：
+
+1. **时钟**：`clock_us` 初始为 NULL，首个新操作可接受任意合法时间；之后要求 `at_us >= clock_us`，同刻允许多个新操作并按数组次序处理。不读取墙上时钟。
+2. **到期**：所有 `expires_at_us <= at_us` 的 active lot 在本轮**同时**处理。先令任何在原分配中引用它们的 active hold 整笔 `invalidated` 并释放其**全部**来源（包括仍有效的其他 lot），再把这些 lot 全部剩余未消耗额度转为 `retired`、状态置 `expired`。因此失效 hold 在活 lot 上释放的额度立即可被后续 `reserve` 使用，且失效 hold 不会被迁移到其他来源。
+3. **业务**：按 kind 执行。`reserve` 取有效 lot 可用量，按 `(expires_at_us, lot_id)` 升序依次分配，允许跨批次；hold 冻结原分配，不随后续重排。`commit` 沿原分配顺序取前 `used_units` 为 consumed、释放余量，`used_units` 可为 0；`cancel` 全释放；`revoke` 在同轮到期处理后要求目标 lot 仍 active，先令依赖它的 active hold 整笔失效并释放各来源，再把目标未消耗量转 `retired`、状态置 `revoked`。`invalidated`/`cancelled`/`committed` 都是不可重新激活的终态。
+
+因到期处理而使本次 `commit` 失效时，本批仍须失败并整批回滚（包括刚处理的到期与时钟推进）；要推进台账需另用 `advance` 成功提交。
+
+`apply` 批次内所有新状态、来源分配、逻辑时钟和操作凭据在一个 SQLite 事务内提交；任一步失败则整批回滚。完全相同的规范操作重试返回原凭据：**先识别重试，再检查时钟**，因此不推进时间、不产生业务效果，原 `at` 早于当前时钟亦成功；同一批内重复已成功的 op 同样如此。新批次可混合旧凭据重试与新操作，时钟只被新操作推进。
+
+### 4.4 规范操作身份
+
+规范身份 = kind + 全部业务字段，时间以 UTC 微秒比较。字段顺序不同、等价的时区写法（如 `+01:00` 与 `Z`）都归一为同一身份。`op_id` 已存在且规范内容不同则失败。
+
+### 4.5 凭据与报告
+
+每个 receipt 严格为 `op_id`、`kind`、`at_us`、`invalidated_hold_ids`、`allocation`、`consumed_allocation`：
+
+* `invalidated_hold_ids` 记录该新操作“到期处理 + revoke”导致的全部失效 hold，按 id 去重排序；
+* `allocation` 仅 `reserve` 为其冻结原分配，否则空数组；
+* `consumed_allocation` 仅 `commit` 为实际核销来源，否则空数组；
+* 分配项严格为 `lot_id`、`units`，只列正量并保持原分配顺序。凭据冻结保存并随数据库持久化，重试时不按当前余额重算。
+
+`report` 外层严格为 `schema_version=1`、`clock_us`、`lots`、`holds`：
+
+* `lots` 按 `lot_id` 排序，每项严格为 `lot_id`、`principal`、`expires_at_us`、`status`、`granted`、`available`、`held`、`consumed`、`retired`；所有量为非负整数且满足 4.1 的守恒。
+* `holds` 按 `hold_id` 排序，每项严格为 `hold_id`、`principal`、`units`、`status`、`allocation`、`used_units`、`consumed_allocation`；`allocation` 始终是冻结原分配、终态也保留；`used_units` 只有 `committed` 为整数，其余为 `null`；`consumed_allocation` 仅 `committed` 可非空。
+
+报告是同一已提交状态的只读一致快照（`BEGIN` 事务内读取），不因查询推进时钟。`report` 复用已有原子写与符号链接拒绝，并拒绝 `output` 与 db 指向同一文件（包括硬链接、`..`、符号链接等路径别名），绝不把 DB 写成报告。DB 提交与报告文件之间不做跨资源原子提交。
+
+### 4.6 失败、重开与确定性
+
+任一新操作失败时，整批此前的新 grant、hold 变化、到期退役、时钟及凭据均不留下，此前已存在的凭据不变。成功提交后关闭并重开数据库必须重现完全相同状态。测试逐批直接验算每个 lot 的守恒与每个 hold 的来源，并覆盖失败后持久化文件状态、无效输入/未知 schema 不损坏旧库或旧报告。仅要求单机本地 SQLite 事务，不要求网络服务、多机分布式协议或断电文件系统模拟。既有三种模式的输入与结果保持不变。
+

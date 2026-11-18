@@ -9,5 +9,6 @@ requires-python = ">=3.11"
 dependencies = []
 [project.scripts]
 api-quota-audit = "api_quota_audit.cli:main"
+api-credit-ledger = "api_quota_audit.ledger:main"
 [tool.setuptools.packages.find]
 where = ["src"]
