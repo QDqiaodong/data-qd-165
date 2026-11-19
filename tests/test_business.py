@@ -76,3 +76,35 @@ class ApiQuotaTests(unittest.TestCase):
         data = {'policies': [{'id': 'p', 'principal': 'a', 'route': '/', 'window_seconds': 60, 'limit': 5}],
                 'events': [{'id': 'e', 'principal': 'a', 'route': '/', 'at': '1969-12-31T23:59:59.999999Z', 'units': 1}]}
         self.assertEqual(analyze(data)['windows'][0]['window_start_utc'], '1969-12-31T23:59:00Z')
+
+
+class ChargebackBusinessTests(unittest.TestCase):
+    """Regression-adjacent hand-computed chargeback checks."""
+
+    def test_hand_computed_pool_cost_and_cells(self):
+        from api_quota_audit.chargeback import chargeback_analyze
+        data = {
+            'tariffs': [{'id': 't', 'principal': 'p', 'route': '/', 'window_seconds': 3600,
+                         'tiers': [{'upto': 10, 'rate_num': 3, 'rate_den': 1},
+                                   {'upto': 20, 'rate_num': 1, 'rate_den': 2},
+                                   {'upto': None, 'rate_num': 1, 'rate_den': 4}]}],
+            'centers': [{'id': 'A', 'required_cents': 13},
+                        {'id': 'B', 'required_cents': 25}],
+            'events': [{'id': 'a', 'principal': 'p', 'route': '/',
+                        'at': '2026-01-01T00:00:00Z', 'units': 10, 'center': 'A'},
+                       {'id': 'b', 'principal': 'p', 'route': '/',
+                        'at': '2026-01-01T00:00:00Z', 'units': 20, 'center': 'B'}],
+            'locks': [],
+        }
+        # U = 30: 10*3 + 10*(1/2) + 10*(1/4) = 30 + 5 + 2.5 = 37.5 -> R = 38.
+        result = chargeback_analyze(data)
+        self.assertEqual(result['pools'][0]['units'], 30)
+        self.assertEqual(result['pools'][0]['exact_cost'], {'numerator': 75, 'denominator': 2})
+        self.assertEqual(result['pools'][0]['invoice_cents'], 38)
+        # a_A = 37.5 * 10/30 = 12.5, a_B = 25.  Only B may round down; the
+        # matrix [13, 25] hits both columns exactly.
+        self.assertEqual([c['exact_cost'] for c in result['cells']],
+                         [{'numerator': 25, 'denominator': 2},
+                          {'numerator': 25, 'denominator': 1}])
+        self.assertEqual([c['cents'] for c in result['cells']], [13, 25])
+        self.assertEqual(result['rounding_error'], {'numerator': 1, 'denominator': 2})

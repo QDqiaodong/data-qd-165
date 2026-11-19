@@ -248,3 +248,130 @@ class ReconcileCliTests(unittest.TestCase):
             report = json.loads(output.read_text())
             self.assertEqual(report['result']['status'], 'feasible')
             self.assertEqual([x['id'] for x in report['result']['ranges']], ['middle', 'whole'])
+
+
+CHARGEBACK_DOCUMENT = {
+    'tariffs': [
+        {'id': 't1', 'principal': 'a', 'route': '/x', 'window_seconds': 3600,
+         'tiers': [{'upto': None, 'rate_num': 1, 'rate_den': 2}]},
+        {'id': 't2', 'principal': 'b', 'route': '/y', 'window_seconds': 3600,
+         'tiers': [{'upto': None, 'rate_num': 1, 'rate_den': 2}]},
+    ],
+    'centers': [{'id': 'A', 'required_cents': 1}, {'id': 'B', 'required_cents': 1}],
+    'events': [
+        {'id': 'a1', 'principal': 'a', 'route': '/x', 'at': '2026-01-01T00:00:00Z',
+         'units': 1, 'center': 'A'},
+        {'id': 'b1', 'principal': 'a', 'route': '/x', 'at': '2026-01-01T00:00:00Z',
+         'units': 1, 'center': 'B'},
+        {'id': 'a2', 'principal': 'b', 'route': '/y', 'at': '2026-01-01T00:00:00Z',
+         'units': 1, 'center': 'A'},
+        {'id': 'b2', 'principal': 'b', 'route': '/y', 'at': '2026-01-01T00:00:00Z',
+         'units': 1, 'center': 'B'},
+    ],
+    'locks': [],
+}
+
+
+class ChargebackCliTests(unittest.TestCase):
+    def invoke(self, source, output, mode='chargeback'):
+        return subprocess.run(
+            [sys.executable, '-m', MODULE + '.cli', '--mode', mode,
+             '--source', str(source), '--output', str(output)],
+            capture_output=True, text=True, timeout=20)
+
+    def test_report_contract_and_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'input.json'
+            output = Path(temporary) / 'report.json'
+            source.write_text(json.dumps(CHARGEBACK_DOCUMENT))
+            result = self.invoke(source, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(output.read_text())
+            self.assertEqual(set(report), {'schema_version', 'mode', 'source_sha256', 'result'})
+            self.assertEqual(report['schema_version'], 4)
+            self.assertEqual(report['mode'], 'chargeback')
+            self.assertEqual(report['source_sha256'],
+                             hashlib.sha256(source.read_bytes()).hexdigest())
+            self.assertEqual(json.loads(result.stdout), report)
+            self.assertEqual(report['result']['status'], 'balanced')
+            self.assertEqual([c['cents'] for c in report['result']['cells']], [0, 1, 1, 0])
+
+    def test_unallocatable_is_successful_and_preserves_pricing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'input.json'
+            output = Path(temporary) / 'report.json'
+            document = json.loads(json.dumps(CHARGEBACK_DOCUMENT))
+            document['locks'] = [{'tariff_id': 't1',
+                                  'window_start': '2026-01-01T00:00:00Z',
+                                  'center': 'A', 'cents': 0},
+                                 {'tariff_id': 't1',
+                                  'window_start': '2026-01-01T00:00:00Z',
+                                  'center': 'B', 'cents': 0}]
+            source.write_text(json.dumps(document))
+            result = self.invoke(source, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(output.read_text())
+            self.assertEqual(report['result']['status'], 'unallocatable')
+            self.assertEqual(report['result']['total_invoice_cents'], 2)
+            self.assertTrue(all(c['cents'] is None for c in report['result']['cells']))
+            self.assertEqual(json.loads(result.stdout), report)
+
+    def test_invalid_input_preserves_existing_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'bad.json'
+            output = Path(temporary) / 'report.json'
+            output.write_text('previous report')
+            bad_documents = [
+                '{}',
+                json.dumps(dict(CHARGEBACK_DOCUMENT, extra=1)),
+                json.dumps(dict(CHARGEBACK_DOCUMENT, tariffs=[])),
+                json.dumps(dict(CHARGEBACK_DOCUMENT,
+                                centers=[{'id': 'A', 'required_cents': True},
+                                         {'id': 'B', 'required_cents': 1}])),
+                json.dumps(dict(CHARGEBACK_DOCUMENT, locks=[
+                    {'tariff_id': 't1', 'window_start': '2026-01-01T00:00:00Z',
+                     'center': 'A', 'cents': 0},
+                    {'tariff_id': 't1', 'window_start': '2026-01-01T00:00:00Z',
+                     'center': 'A', 'cents': 0}])),
+                json.dumps(dict(CHARGEBACK_DOCUMENT, events=[
+                    dict(CHARGEBACK_DOCUMENT['events'][0], center='ghost')])),
+            ]
+            for raw in bad_documents:
+                with self.subTest(raw=raw[:80]):
+                    source.write_text(raw)
+                    result = self.invoke(source, output)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(output.read_text(), 'previous report')
+
+    def test_source_output_collision_and_hard_link(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'input.json'
+            source.write_text(json.dumps(CHARGEBACK_DOCUMENT))
+            original = source.read_bytes()
+            self.assertEqual(self.invoke(source, source).returncode, 2)
+            self.assertEqual(source.read_bytes(), original)
+            alias = Path(temporary) / 'alias.json'
+            import os
+            os.link(source, alias)
+            self.assertEqual(self.invoke(source, alias).returncode, 2)
+            self.assertEqual(alias.read_bytes(), original)
+
+    def test_symlink_output_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'input.json'
+            source.write_text(json.dumps(CHARGEBACK_DOCUMENT))
+            target = Path(temporary) / 'target'
+            target.write_text('unchanged')
+            link = Path(temporary) / 'link.json'
+            link.symlink_to(target)
+            self.assertEqual(self.invoke(source, link).returncode, 2)
+            self.assertEqual(target.read_text(), 'unchanged')
+
+    def test_fixture_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / 'report.json'
+            result = self.invoke(ROOT / 'fixtures/chargeback.json', output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(output.read_text())
+            self.assertEqual(report['result']['status'], 'balanced')
+            self.assertEqual(report['result']['total_invoice_cents'], 180)

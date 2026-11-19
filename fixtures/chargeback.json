@@ -1,0 +1,20 @@
+{
+  "tariffs": [
+    {"id": "t-read", "principal": "acme", "route": "/read", "window_seconds": 3600,
+     "tiers": [{"upto": 100, "rate_num": 1, "rate_den": 1},
+               {"upto": null, "rate_num": 1, "rate_den": 3}]},
+    {"id": "t-write", "principal": "acme", "route": "/write", "window_seconds": 3600,
+     "tiers": [{"upto": null, "rate_num": 2, "rate_den": 1}]}
+  ],
+  "centers": [
+    {"id": "A", "required_cents": 72},
+    {"id": "B", "required_cents": 108}
+  ],
+  "events": [
+    {"id": "r1", "principal": "acme", "route": "/read", "at": "2026-01-01T00:00:00Z", "units": 70, "center": "A"},
+    {"id": "r2", "principal": "acme", "route": "/read", "at": "2026-01-01T00:00:00Z", "units": 90, "center": "B"},
+    {"id": "w1", "principal": "acme", "route": "/write", "at": "2026-01-01T00:00:00Z", "units": 10, "center": "A"},
+    {"id": "w2", "principal": "acme", "route": "/write", "at": "2026-01-01T00:00:00Z", "units": 20, "center": "B"}
+  ],
+  "locks": []
+}

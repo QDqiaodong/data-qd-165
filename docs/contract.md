@@ -1,6 +1,6 @@
 # API 配额审计数据契约
 
-本工具有三种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。此外提供两个独立的本地 SQLite 命令：持久化预付额度台账（见第 4 节）与可追溯用量事实仓（见第 5 节）。两者都只使用 Python 标准库 `sqlite3` 与本地文件，不连接任何外部服务，也不改变上述三种模式的输入与结果；事实仓与台账互不读取或改写对方的存储。
+本工具有四种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。此外提供两个独立的本地 SQLite 命令：持久化预付额度台账（见第 4 节）与可追溯用量事实仓（见第 5 节）。两者都只使用 Python 标准库 `sqlite3` 与本地文件，不连接任何外部服务，也不改变上述四种模式的输入与结果；事实仓与台账互不读取或改写对方的存储。
 
 ## 1. 默认固定窗口用量审计（schema_version=1，`--mode audit`，可省略）
 
@@ -302,3 +302,70 @@ api-usage-warehouse query  --db PATH --max-seq N --event-before ISO --output JSO
 * 把 B 策略改为 `01:31` 开始会产生覆盖缺口 → 整批失败，不出现 `seq2`；此前全部可见历史与 receipt 在错误前后逐项相等（测试直接比对 `batches`/版本行与同双截止报告，不使用被测查询生成期望）。
 * 仅修订策略阈值/窗口长度而事件未改：新 `seq` 报表重归属与重算（`policy_revision`、窗口锚点、`limit`、超限随之改变），旧 `seq` 报告逐字节不变。
 * 测试覆盖：撤回后恢复、策略撤回与事件撤回同批、同身份同批多版本、相邻生效区间、一个 epoch 窗口内换策略（不合并限额）、负 epoch 及微秒边界、时区等价与数组乱序批次重试、已用 revision/冲突 batch、空批次、源 JSON 及输出保护、关库重开；并沿用原业务测试验证共享聚合未回归。
+
+
+## 6. API 共享阶梯计价与成本中心费用分摊（schema_version=4，`--mode chargeback`）
+
+新增离线模式，回答「同一接口窗口内多个成本中心的共享用量如何按供应商阶梯计价，并把整数分同时对齐到各中心已批准金额与人工锁定的格」。它复用 `ident`、精确 UTC 微秒 `instant`、负 epoch 地板窗口（`model.window_start`）以及受限 JSON/原子发布，但**不读取也不写入**额度台账、事实仓或旧的 audit/retention/reconcile 结构，不选择保留请求，也不反推未知用量。Python 入口为 `chargeback.chargeback_analyze(data)`；命令为 `api-quota-audit --mode chargeback` / `python -m api_quota_audit.cli`。
+
+### 6.1 输入
+
+顶层字段严格为 `tariffs`、`centers`、`events`、`locks`，四者均为数组，缺字段或多字段整份失败。全部 id、principal、route、center 沿用 `ident`；**所有整数拒绝 bool 与浮点**。实现先完整校验四个数组（含全部金额、tiers、事件与 locks），之后才作可分配性判断；不会因为金额不平或锁定矛盾而跳过后续非法输入。
+
+* `tariffs`：最多 40 项，每项严格为 `id`、`principal`、`route`、`window_seconds`、`tiers`。`id` 唯一，`(principal, route)` 唯一。`window_seconds` 为 1..31,536,000 的整数。`tiers` 为 1..8 项**有序边际阶梯**，每项严格为 `upto`、`rate_num`、`rate_den`：`rate_num` 为 0..10^9、`rate_den` 为 1..10^6 的整数（单位「分/用量单位」）；`upto` 为正整数累计用量上界，有限值最大 10^15 且严格递增，只有末项且必须末项为 `null`（无穷）。第一阶从累计 0 开始；不要求单价递减，0 价合法。
+* `centers`：最多 50 项，每项严格为 `id`、`required_cents`；`id` 唯一，`required_cents` 为 0..10^18 的整数。它是本次全部池合计后的**指定中心金额**（不是预算上限）。无用量中心也保留且只能归集 0 分。空 `centers` 仅在无 `events` 且无 `locks` 时合法。
+* `events`：最多 10,000 项，每项严格为 `id`、`principal`、`route`、`at`、`units`、`center`；`units` 为 1..10^9 的整数，`at` 沿用 `instant`（显式时区、精确微秒、等价偏移视为同一 UTC 时刻），`center` 必须在 `centers` 中，每条事件必须找到唯一 `(principal, route)` scope tariff。相同 `id` 且**全部规范字段**相同视为一条（时区等价视为相同）；同 id 任一字段不同（含 `center`）整份失败。重复规范事件不重复计费。
+* `locks`：最多 2,000 项，每项严格为 `tariff_id`、`window_start`、`center`、`cents`；`cents` 为 0..10^18 的整数。`window_start` 为显式时区 ISO，规范到微秒后必须**恰为**所指 tariff 的一个窗口起点，且所指 `(tariff, window, center)` 非空格真实存在。未知 tariff/center/池/格以及同格重复 lock 属输入错误（重复金额相同也拒绝）。结构合法但 `cents` 不在该格 floor/ceil 内是合法的 `unallocatable` 业务结果，不报输入错误。
+
+### 6.2 窗口、价格汇总与精确计价
+
+每条事件按所属 `tariff.window_seconds` 落入 UTC epoch 锚定的半开窗口 `[start,end)`：`start = floor(at_us / (window_seconds*1e6)) * window_seconds`（负 epoch 同用地板除）。池键为 `(tariff_id, window_start_us)`。同池累计 `U`，每个非空 `(tariff_id, window_start_us, center)` 格累计 `u`；无事件的 tariff 不产生池，无用量的池中心组合不生成格。规范事件归并后，池数最多 80、非空格最多 2000，超限即输入错误。
+
+**共享阶梯先对池总量计价，再分摊到中心**：
+
+```
+C = Σ_k overlap_k · rate_num_k / rate_den_k        # 与 [0,U) 的区间重叠
+a = C · u / U                                        # 该格精确费用
+R = floor(C + 1/2)                                  # 恰半分向上，非银行家舍入
+```
+
+即折扣阶梯只按池内全部已知用量的总量应用一次，而不是把同一阶梯分别套到每个中心的用量。`C`、`a` 全程为精确有理数，输出一律最简非负 `{numerator, denominator}`（`denominator > 0`，0 统一为 `0/1`）。即使全池单价为 0，已发生用量仍产生 0 费用格。不输出逐事件价格，也不按事件先舍入。
+
+### 6.3 双边受控分币的联合求解
+
+对每个非空格令 `z ∈ {floor(a), ceil(a)}`（整数 `a` 只有一个选择）。要求：
+
+* 每池 `Σ z = R`（行约束）；
+* 每中心 `Σ z = required_cents`（列约束）；
+* 每个 lock 的格金额等于 `cents`。
+
+记 `z = floor(a) + x`，`x ∈ {0,1}`。行/列约束与 lock 因此化为**二部 0-1 可行流**：行（池）→ 格的容量一单位边 → 列（中心）。行列合计不等、格界被锁死或出现任何不可达的列/行时，整张矩阵无解。`sum(required_cents) != sum(R)` 直接不可分配。
+
+**主目标**为跨全部非空格的绝对舍入误差 `E = Σ |z - a|`。因为 `|z-a|` 相对 `floor` 的增量是 `1 - 2·frac(a)`（可为负），把「取 ceil」看作一条费用为该精确有理数的容量一边，误差最小化即**最小费用流**。
+
+**次目标**在 `E` 相同的矩阵中，取按 `(tariff_id, window_start_us, center)` 排序的完整 `z` 向量的字典序最小者。实现给每个自由格分配一个位权（排序靠前者位更高），作为与主费用**严格分层**的第二费用分量，按 `(主误差, 位权)` 的字典序比较；主误差优先，位权只在主误差相等时决胜。因此不需要逐格枚举，也不必按中心 id 挑选尾差。
+
+实现自带一个精确有理数势函数的最短路连续增广最小费用流（Dijkstra + Johnson 位势），不 import 旧 retention 代码。它与旧 retention 流算法结构相近（邻接表 + 二分堆 + 连续增广），但旧算法有两点假设在本模式不成立，实现据此改写：
+
+* **单位增广假设**：旧算法每轮沿残量路径增广恰好 1 单位，因为每条请求边容量为 1。本模式的源→行、列→sink 边容量是待补的整数分差，可能大于 1；虽然每个自由格边容量为 1 使增益自然受限，实现仍按路径上的最小残量 `push` 增广，而不是硬编码 `-= 1`，从而在自由格不足时也能正确报告不可达而非死循环。
+* **初始势假设**：旧算法假定初始网络为 DAG 且只有非负费用，用一次有序扫描即可。本模式的格费用 `1 - 2·frac(a)` 可为负，且「待补差额为 0」的行节点从真实源不可达却仍有出边，单次拓扑扫描会留下负 reduced cost。因此势函数改为从全零距离出发、对全部节点松弛至收敛的 Bellman-Ford（等价于虚拟零费用超级源，但不物化其边），得到对所有残量边 reduced cost ≥ 0 的 Johnson 势。
+
+势与费用全程为 `Fraction`（或「有理数 + 整数位权」的字典序对），不使用浮点 epsilon、逐分金额枚举或外部求解器。求解后必须逐行、逐列、逐 lock 复核；任一行列/格界/lock 无法同时满足即返回 `unallocatable`，绝不逐池独立舍入后悄悄改列合计或转移不存在的用量。
+
+### 6.4 输出
+
+外层严格为 `schema_version=4`、`mode="chargeback"`、`source_sha256`、`result`。`result` 严格为 `status`、`pools`、`centers`、`cells`、`total_invoice_cents`、`rounding_error`、`deduplicated_event_count`；`status` ∈ `balanced` / `unallocatable`。
+
+* `pools` 按 `(tariff_id, window_start_us)` 排序，每项严格为 `tariff_id`、`principal`、`route`、`window_start_us`、`window_end_us`、`units`、`exact_cost`、`invoice_cents`；时间为精确 UTC 微秒整数，`exact_cost` 是 `C`，`invoice_cents` 是 `R`。`total_invoice_cents = Σ R`。
+* `centers` 按 id 排序，每项严格为 `id`、`required_cents`、`actual_cents`。
+* `cells` 列全部非空格，按 `(tariff_id, window_start_us, center)` 排序，每项严格为 `tariff_id`、`window_start_us`、`center`、`units`、`exact_cost`、`cents`、`locked`；`exact_cost` 是 `a`，`locked` 是该格是否有 lock 的布尔值。
+* `balanced`：全部 `cents`/`actual_cents` 为非负整数，`rounding_error` 为最简分数 `E`。
+* `unallocatable`：仍返回完整且相同的精确计价基础、池金额与指定中心金额，但所有 `cents`/`actual_cents` 及 `rounding_error` 均为 `null`，不留部分分配。
+
+全空输入是 `balanced`，三个数组为空，总分与事件数为 0，误差 `0/1`；有零目标的空中心时保留该中心 `actual_cents=0`。合法 `unallocatable` 仍写报告并退出 0；输入/格式/文件错误退出 2、写 stderr，不输出成功 JSON 且旧报告保留。stdout 是保存文件的同一 JSON。源路径及其硬链接/路径别名与目标同文件必须拒绝，输出符号链接拒绝；保留受限 JSON 读取及原子写入。输入排列不改变业务 `result`（tiers 是有序数据，不能乱序）；重复同一规范事件也不改变 `result`，`source_sha256` 仍反映实际源字节。
+
+### 6.5 验收与测试要点
+
+* 两池各产生 1 分、每池 A/B 各占一半、A/B 各要求 1 分：逐池给 A 补尾差虽局部正确却破坏中心列，合法且字典序最小矩阵为 `[0,1,1,0]`；锁定首格为 1 后联动为 `[1,0,0,1]`；改变一池价格后重算费用、格界和联合可分性。
+* 测试规模足够小时**独立枚举**所有格 floor/ceil 组合，用独立实现的约束验算与精确误差核全局结果；绝不调用被测求解器生成期望。覆盖共享折扣按池总量而非各中心单算、阶梯临界点与 0 价、精确半分、整数格不能被加 1、同格重复事件与 center 冲突、多时区与负 epoch/微秒窗口边界、两套合计相同但支持关系无解的稀疏矩阵、锁定可行与锁定不可行、无用量中心、空输入、主误差不同与并列的字典序决胜、不同分母下不得浮点近似。
+* 另提供有多个池/中心及跨池锁定的可运行较大用例，验证生产路径无需指数枚举或逐分金额展开；并实跑 CLI 的成功、业务无解与非法输入保留旧报告，沿用旧业务测试检查回归。

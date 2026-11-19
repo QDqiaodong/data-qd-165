@@ -73,3 +73,14 @@ PYTHONPATH=src python3 -m api_quota_audit.cli \
 `python -m api_quota_audit.warehouse` 是同等入口；Python 调用 `create_database`、`ingest_batch`、`query_warehouse`。`create` 不覆盖已有库，stdout 为 `{"schema_version":1}`；`ingest` 在一个事务内校验 revision 连续性、策略区间不重叠及每条有效事件唯一策略，成功后 stdout 为冻结的批次 receipt；`query` 从只读一致快照发布双截止报告，stdout 与输出文件逐字节相同。业务/输入错误退出 2、只写 stderr，失败批次不留下序号或版本；不隐式建库、拒绝未知 schema 与符号链接 DB、拒绝输出与 DB 同文件。历史存储方案与隔离性说明见 [数据契约](docs/contract.md) 第 5 节。
 
 
+
+## API 共享阶梯计价与成本中心费用分摊（`--mode chargeback`）
+
+`--mode chargeback` 把同一接口窗口内全部已知用量先按供应商阶梯汇总计价，再把精确有理数费用按池内用量占比分摊到各成本中心，并联合求解整数分矩阵：每池整数分合计等于该池精确总费用的四舍五入（恰半分向上），每中心合计等于输入的 `required_cents`，每格只能是自身精确费用的 floor 或 ceil，人工 lock 的格必须取其指定金额。主目标为跨全部格的最小绝对舍入误差，并列时取按 `(tariff_id, window_start_us, center)` 排序的完整 cents 向量字典序最小者。输入/输出契约、联合可分性、精确求解结构与复用旧流算法时的单位增广/初始势修正见 [数据契约](docs/contract.md) 第 6 节。
+
+```sh
+PYTHONPATH=src python3 -m api_quota_audit.cli \
+  --mode chargeback --source fixtures/chargeback.json --output run/chargeback.json
+```
+
+输出 `schema_version=4`，`result` 严格含 `status`（`balanced`/`unallocatable`）、按池排序的 `pools`、按 id 排序的 `centers`、按向量顺序的 `cells`、`total_invoice_cents`、`rounding_error` 与 `deduplicated_event_count`。业务无解是合法报告、退出 0，但所有分币结果与误差为 `null`，精确计价基础仍完整返回；输入/格式/文件错误退出 2 并保留旧报告。全部金额与误差为精确有理数，不使用浮点 epsilon、逐分金额枚举或外部求解器；本模式不读写额度台账与事实仓。
