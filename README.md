@@ -1,7 +1,6 @@
 # data-qd-165 · API配额窗口审计
 
 Exact fixed-window API usage and quota breach attribution。业务输入、计算和当前边界详见 [数据契约](docs/contract.md)。
-
 ## 安装与演示
 
 Python >=3.11，运行和测试仅用标准库；建议 Python 3.12。使用 uv 建立独立环境，构建工具锁版本。首次安装无公共缓存时需要访问包索引；业务运行不访问网络。
@@ -84,3 +83,14 @@ PYTHONPATH=src python3 -m api_quota_audit.cli \
 ```
 
 输出 `schema_version=4`，`result` 严格含 `status`（`balanced`/`unallocatable`）、按池排序的 `pools`、按 id 排序的 `centers`、按向量顺序的 `cells`、`total_invoice_cents`、`rounding_error` 与 `deduplicated_event_count`。业务无解是合法报告、退出 0，但所有分币结果与误差为 `null`，精确计价基础仍完整返回；输入/格式/文件错误退出 2 并保留旧报告。全部金额与误差为精确有理数，不使用浮点 epsilon、逐分金额枚举或外部求解器；本模式不读写额度台账与事实仓。
+
+## 乱序连续会话变更流（`--mode sessions`）
+
+`--mode sessions` 随每条到达数据修正尚未结束的调用会话，并按数据进度把确定结束的会话交给结算：同 `(principal, route)` 的有效事件按 `(at_us, id)` 排序，相邻间隔严格小于该 scope 的 `gap_seconds` 即同属一个最大连续会话（间隔恰等即分段，非固定桶）。乱序插入可桥接多个会话，撤回桥接事件可拆分会话；watermark 单调推进，迟到边界 `F = watermark_us - allowed_lateness_us` 之后的新事件只登记不计量，已封会话及其成员不可更改、不可重开。输入/输出契约、单步原子性与不可逆变更语义见 [数据契约](docs/contract.md) 第 7 节。
+
+```sh
+PYTHONPATH=src python3 -m api_quota_audit.cli \
+  --mode sessions --source fixtures/sessions.json --output run/sessions.json
+```
+
+Python 入口为 `sessions.SessionAccumulator(policies, allowed_lateness_seconds)`（逐步 `apply(operation)` 返回本步 change、`snapshot()` 返回当前快照）与按 `operations` 原次序收集 `trace` 的 `sessions.sessions_analyze(data)`；不会先按事件时间重排输入，第 k 步也不使用后续操作。实际维护方法是每个合法 `apply` 在同一状态变换内先暂存接纳/撤回/watermark 效果，再从当前开放有效成员全量重建最大组件、再封账 `closes_at_us <= F` 的组件，因此合并、拆分、身份更名（成员中字符串序最小的 event id）、用量边界与封账决定共享同一当前状态；撤回拆出的早片段即使 watermark 未动也当步结算，桥接后的长会话不沿用旧短片段期限。输出 `schema_version=5`，change 严格含 `step`、`status`、`retracted_session_ids`、`upserts`、`sealed_sessions`，下游只保存上一开放表与已封表即可按「删除撤销 id → upsert 替换 → sealed 移除开放项并新增」重建；全部返回对象为独立拷贝，后续调用无法追改旧 change/snapshot。输入/格式错误退出 2 并保留旧报告，既有四种模式与独立台账、事实仓契约不变。

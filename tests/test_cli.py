@@ -375,3 +375,155 @@ class ChargebackCliTests(unittest.TestCase):
             report = json.loads(output.read_text())
             self.assertEqual(report['result']['status'], 'balanced')
             self.assertEqual(report['result']['total_invoice_cents'], 180)
+
+
+SESSIONS_DOCUMENT = {
+    'policies': [{'principal': 'p', 'route': '/r', 'gap_seconds': 6}],
+    'allowed_lateness_seconds': 2,
+    'operations': [
+        {'kind': 'event', 'id': 'a', 'principal': 'p', 'route': '/r',
+         'at': '1970-01-01T00:00:00Z', 'units': 1},
+        {'kind': 'event', 'id': 'b', 'principal': 'p', 'route': '/r',
+         'at': '1970-01-01T00:00:05Z', 'units': 2},
+        {'kind': 'event', 'id': 'c', 'principal': 'p', 'route': '/r',
+         'at': '1970-01-01T00:00:10Z', 'units': 3},
+        {'kind': 'watermark', 'at': '1970-01-01T00:00:10Z'},
+        {'kind': 'retract', 'event_id': 'b'},
+        {'kind': 'event', 'id': 'd', 'principal': 'p', 'route': '/r',
+         'at': '1970-01-01T00:00:07Z', 'units': 9},
+        {'kind': 'event', 'id': 'b', 'principal': 'p', 'route': '/r',
+         'at': '1970-01-01T00:00:05Z', 'units': 2},
+    ],
+}
+
+
+class SessionsCliTests(unittest.TestCase):
+    def invoke(self, source, output, mode='sessions'):
+        return subprocess.run(
+            [sys.executable, '-m', MODULE + '.cli', '--mode', mode,
+             '--source', str(source), '--output', str(output)],
+            capture_output=True, text=True, timeout=20)
+
+    def test_report_contract_and_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'input.json'
+            output = Path(temporary) / 'report.json'
+            source.write_text(json.dumps(SESSIONS_DOCUMENT))
+            result = self.invoke(source, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(output.read_text())
+            self.assertEqual(set(report),
+                             {'schema_version', 'mode', 'source_sha256',
+                              'result'})
+            self.assertEqual(report['schema_version'], 5)
+            self.assertEqual(report['mode'], 'sessions')
+            self.assertEqual(report['source_sha256'],
+                             hashlib.sha256(source.read_bytes()).hexdigest())
+            self.assertEqual(json.loads(result.stdout), report)
+
+            analyzed = report['result']
+            self.assertEqual(set(analyzed),
+                             {'watermark_us', 'cutoff_us', 'open_sessions',
+                              'sealed_sessions', 'trace'})
+            self.assertEqual(analyzed['watermark_us'], 10_000_000)
+            self.assertEqual(analyzed['cutoff_us'], 8_000_000)
+            self.assertEqual([t['status'] for t in analyzed['trace']],
+                             ['accepted', 'accepted', 'accepted',
+                              'watermark', 'retracted', 'late', 'duplicate'])
+            self.assertEqual([t['step'] for t in analyzed['trace']],
+                             [1, 2, 3, 4, 5, 6, 7])
+            self.assertEqual(
+                [s['session_id'] for s in analyzed['open_sessions']], ['c'])
+            self.assertEqual(
+                [s['session_id'] for s in analyzed['sealed_sessions']], ['a'])
+            # stdout and the saved file are the same JSON.
+            self.assertEqual(json.loads(output.read_text()), report)
+
+    def test_empty_operations_have_null_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'input.json'
+            output = Path(temporary) / 'report.json'
+            source.write_text(json.dumps({
+                'policies': SESSIONS_DOCUMENT['policies'],
+                'allowed_lateness_seconds': 0,
+                'operations': [],
+            }))
+            result = self.invoke(source, output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            analyzed = json.loads(output.read_text())['result']
+            self.assertIsNone(analyzed['watermark_us'])
+            self.assertIsNone(analyzed['cutoff_us'])
+            self.assertEqual(analyzed['open_sessions'], [])
+            self.assertEqual(analyzed['sealed_sessions'], [])
+            self.assertEqual(analyzed['trace'], [])
+
+    def test_invalid_input_preserves_existing_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'bad.json'
+            output = Path(temporary) / 'report.json'
+            output.write_text('previous report')
+            conflict = json.loads(json.dumps(SESSIONS_DOCUMENT))
+            conflict['operations'].append(
+                {'kind': 'event', 'id': 'a', 'principal': 'p', 'route': '/r',
+                 'at': '1970-01-01T00:00:00Z', 'units': 42})
+            unknown_retract = json.loads(json.dumps(SESSIONS_DOCUMENT))
+            unknown_retract['operations'] = [
+                {'kind': 'retract', 'event_id': 'ghost'}]
+            bad_documents = [
+                '{}',
+                json.dumps(dict(SESSIONS_DOCUMENT, extra=1)),
+                json.dumps(dict(SESSIONS_DOCUMENT, allowed_lateness_seconds=-1)),
+                json.dumps(dict(SESSIONS_DOCUMENT,
+                                policies=[{'principal': 'p', 'route': '/r',
+                                           'gap_seconds': 0}])),
+                json.dumps(conflict),
+                json.dumps(unknown_retract),
+                json.dumps(dict(SESSIONS_DOCUMENT, operations=[
+                    {'kind': 'watermark',
+                     'at': '1970-01-01T00:00:10Z'},
+                    {'kind': 'watermark',
+                     'at': '1970-01-01T00:00:09Z'}])),
+            ]
+            for raw in bad_documents:
+                with self.subTest(raw=raw[:80]):
+                    source.write_text(raw)
+                    result = self.invoke(source, output)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(output.read_text(), 'previous report')
+
+    def test_source_output_collision_hard_link_and_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'input.json'
+            source.write_text(json.dumps(SESSIONS_DOCUMENT))
+            original = source.read_bytes()
+            self.assertEqual(self.invoke(source, source).returncode, 2)
+            self.assertEqual(source.read_bytes(), original)
+            alias = Path(temporary) / 'alias.json'
+            import os
+            os.link(source, alias)
+            self.assertEqual(self.invoke(source, alias).returncode, 2)
+            self.assertEqual(alias.read_bytes(), original)
+            target = Path(temporary) / 'target'
+            target.write_text('unchanged')
+            link = Path(temporary) / 'link.json'
+            link.symlink_to(target)
+            self.assertEqual(self.invoke(source, link).returncode, 2)
+            self.assertEqual(target.read_text(), 'unchanged')
+
+    def test_fixture_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / 'report.json'
+            result = self.invoke(ROOT / 'fixtures/sessions.json', output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(output.read_text())
+            analyzed = report['result']
+            self.assertEqual(
+                [s['session_id'] for s in analyzed['sealed_sessions']],
+                ['a', 's1', 's2'])
+            self.assertEqual(
+                [s['session_id'] for s in analyzed['open_sessions']], ['c'])
+            self.assertEqual(
+                [t['status'] for t in analyzed['trace']],
+                ['accepted', 'accepted', 'accepted', 'accepted', 'accepted',
+                 'duplicate', 'watermark', 'retracted', 'late', 'noop',
+                 'watermark', 'sealed'])

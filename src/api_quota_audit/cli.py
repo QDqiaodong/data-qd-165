@@ -6,6 +6,7 @@ from .chargeback import chargeback_analyze
 from .model import analyze
 from .reconcile import reconcile_analyze
 from .retention import retention_analyze
+from .sessions import sessions_analyze
 
 def _same_file(source, output):
     """Reject the same path, hard links and symlink/path aliases."""
@@ -27,13 +28,15 @@ def run(source, mode):
         return {'schema_version':2,'mode':'retention','source_sha256':digest,'result':retention_analyze(data)}
     if mode=='reconcile':
         return {'schema_version':3,'mode':'reconcile','source_sha256':digest,'result':reconcile_analyze(data)}
+    if mode=='sessions':
+        return {'schema_version':5,'mode':'sessions','source_sha256':digest,'result':sessions_analyze(data)}
     return {'schema_version':1,'source_sha256':digest,'result':analyze(data)}
 
 def main():
     parser=argparse.ArgumentParser(description=DESCRIPTION)
     parser.add_argument('--source',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--mode',choices=('audit','retention','reconcile','chargeback'),default='audit')
+    parser.add_argument('--mode',choices=('audit','retention','reconcile','chargeback','sessions'),default='audit')
     args=parser.parse_args()
     try:
         if _same_file(args.source,args.output):raise ValueError('input and output must differ')

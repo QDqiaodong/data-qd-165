@@ -1,6 +1,6 @@
 # API 配额审计数据契约
 
-本工具有四种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。此外提供两个独立的本地 SQLite 命令：持久化预付额度台账（见第 4 节）与可追溯用量事实仓（见第 5 节）。两者都只使用 Python 标准库 `sqlite3` 与本地文件，不连接任何外部服务，也不改变上述四种模式的输入与结果；事实仓与台账互不读取或改写对方的存储。
+本工具有五种离线模式，均只读取本地 JSON、只写本地报告，不调用任何外部服务。此外提供两个独立的本地 SQLite 命令：持久化预付额度台账（见第 4 节）与可追溯用量事实仓（见第 5 节）。两者都只使用 Python 标准库 `sqlite3` 与本地文件，不连接任何外部服务，也不改变上述五种模式的输入与结果；事实仓与台账互不读取或改写对方的存储。
 
 ## 1. 默认固定窗口用量审计（schema_version=1，`--mode audit`，可省略）
 
@@ -369,3 +369,90 @@ R = floor(C + 1/2)                                  # 恰半分向上，非银�
 * 两池各产生 1 分、每池 A/B 各占一半、A/B 各要求 1 分：逐池给 A 补尾差虽局部正确却破坏中心列，合法且字典序最小矩阵为 `[0,1,1,0]`；锁定首格为 1 后联动为 `[1,0,0,1]`；改变一池价格后重算费用、格界和联合可分性。
 * 测试规模足够小时**独立枚举**所有格 floor/ceil 组合，用独立实现的约束验算与精确误差核全局结果；绝不调用被测求解器生成期望。覆盖共享折扣按池总量而非各中心单算、阶梯临界点与 0 价、精确半分、整数格不能被加 1、同格重复事件与 center 冲突、多时区与负 epoch/微秒窗口边界、两套合计相同但支持关系无解的稀疏矩阵、锁定可行与锁定不可行、无用量中心、空输入、主误差不同与并列的字典序决胜、不同分母下不得浮点近似。
 * 另提供有多个池/中心及跨池锁定的可运行较大用例，验证生产路径无需指数枚举或逐分金额展开；并实跑 CLI 的成功、业务无解与非法输入保留旧报告，沿用旧业务测试检查回归。
+
+## 7. 乱序事件的连续会话变更流（schema_version=5，`--mode sessions`）
+
+新增离线模式，把乱序到达的 API 调用事件按「相邻间隔」维护成最大连续会话，并随每一步操作输出旧身份撤销、开放会话快照 upsert 与不可撤销的封账增量。它复用 `ident`、精确 UTC 微秒 `instant`（含等价时区、负 epoch 与微秒比较）以及受限 JSON/原子发布，但**不套用任何 epoch 固定窗口聚合**，也不读取或写入额度台账、事实仓或其他模式的结构。Python 入口为 `sessions.SessionAccumulator(policies, allowed_lateness_seconds)`（逐步 `apply(operation)` / `snapshot()`）与 `sessions.sessions_analyze(data)`；命令为 `api-quota-audit --mode sessions --source JSON --output JSON` 与 `python -m api_quota_audit.cli` 同等调用。状态只在本次内存对象生命周期内有效：无数据库、无断点恢复、无后台服务。
+
+### 7.1 输入
+
+顶层字段严格为 `policies`、`allowed_lateness_seconds`、`operations`，缺字段或多字段整份失败。
+
+* `policies`：最多 100 项，每项严格为 `principal`、`route`、`gap_seconds`；scope `(principal, route)` 唯一，重复即失败。`gap_seconds` 为 1..31,536,000 的整数（拒绝 bool/浮点），同一 scope 的所有会话共用该间隔。
+* `allowed_lateness_seconds`：0..31,536,000 的整数（拒绝 bool/浮点）。
+* `operations`：最多 2000 项，可空。每项按 `kind` 严格区分：
+  * `event`：严格为 `kind`、`id`、`principal`、`route`、`at`、`units`；`units` 为 1..1,000,000,000 的整数，`at` 沿用 instant 归一化为精确 UTC 微秒。每条 event 都必须匹配一条 policy scope，**即使它将被判迟到或是重复重试，也先完整校验字段与 scope**。
+  * `retract`：严格为 `kind`、`event_id`。
+  * `watermark`：严格为 `kind`、`at`。
+* 全部 id/scope 沿用 ident；事件 id 是**全局唯一身份**，不按 scope 分开。
+
+### 7.2 会话定义与实际维护方法
+
+会话只包含「已接纳且尚未撤回、且尚未封账」的成员。对每个 scope，把成员按 `(at_us, id)` 排序，相邻两条**间隔严格小于 `gap_us = gap_seconds*1e6`** 即属于同一个最大连通组件；间隔恰等于 `gap_us` 时分段。因此它不是固定桶，也不是只把新事件与最早成员比较：多个事件同一微秒合法，删除中间桥接成员可把一个组件拆成多个，删除最后一个成员则会话消失。
+
+实现不维护增量组件索引，而是在每个合法 `apply` 内执行同一个状态变换：
+
+1. **先校验、暂存本步效果**：事件接纳/判迟到/识别重试、撤回、watermark 校验都先在不修改既有状态的前提下完成；任何输入错误在此抛出 `ValueError`，登记、watermark、step 与两张表全部保持此前状态，调用者可继续喂合法操作。
+2. **从暂存后的开放成员全量重建最大组件**：用当前全部有效开放事件（排除已封账、迟到与已撤回身份，绝不把旧已封事件放回开放构造）按 scope 重新分组。会话身份 `session_id` 取当前成员中 Python 字符串序最小的 event id；`first_us`/`last_us` 为成员最早/最晚微秒，`closes_at_us = last_us + gap_us`，`units` 为成员 units 的精确整数和，`event_ids` 按字符串序排列。身份更名可由乱序插入、桥接或删除最小 id 触发，成员、用量与边界始终来自该身份当前所在的组件。
+3. **在同一状态上封账**：对重建后的组件，凡 `closes_at_us <= F` 即封账并离开开放集合；`F = None` 时不封。
+
+全量重建保证合并、拆分、身份更名与封账决定共享同一份当前状态，不存在索引与事实漂移；输入规模上限 2000 步，每步线性重建成本可接受。
+
+### 7.3 Watermark、迟到边界与不可撤销封账
+
+watermark 起始为 `null`；第一条可取任意合法时刻，之后归一化值不得倒退（相等合法），系统墙钟不参与业务。定义迟到边界
+
+```
+F = watermark_us - allowed_lateness_seconds * 1_000_000
+```
+
+没有 watermark 时 `F = null`，任何新事件都不因时间迟到。新 event 的 `at_us < F` 判为 `late`：只做身份登记、永不贡献用量、永不进入会话；`at_us >= F`（含恰等 F）判 `accepted` 并进入开放会话。
+
+封账是不可撤销的终态：
+
+* 封账把完整会话快照追加到已封表，成员终态化并离开开放集合；之后不得撤销、更新或重新使用该 `session_id`。
+* 由于新事件满足 `at_us >= F` 而连接条件为严格小于 gap，新事件不可能再与已封成员相连；而能在全量历史上连接已封早段的事件，其时刻必然 `at_us < F` 而被判迟到，因此**先封独立早段、后到历史连接事件时封账快照保持不变**。
+* 对已封会话成员的 `retract` 返回合法业务拒绝 `sealed`，不改任何会话。
+
+### 7.4 事件身份、重试与撤回
+
+首次 event 先登记规范内容 `(principal, route, at_us, units)`（等价时区表示同一规范微秒）。
+
+* 完全相同的规范身份重试返回 `duplicate`：**先识别重试，再做任何 F 裁决**，因此不重新接纳、不重复计量，也不因原时刻早于当前 F 而改判；原身份即使已 `late`、已被撤回或已经封账也是如此。重试原 event 不会撤销此前的 retract 结果。
+* 同 id 但任何规范字段不同是输入错误（`ValueError`），不能用同 id 更正或重新激活，且失败不留半步状态。
+* `retract` 必须指向先前已登记的 id，未知 id 是输入错误。若它仍是开放有效成员则移除并置 `retracted`；它的 `at_us` 即使早于 F，只要所在会话未封账仍允许撤回。若已撤回或首次登记即为 `late`，返回 `noop`；若属于已封会话，返回 `sealed`。
+
+### 7.5 单步原子性、封账时机与期限一致性
+
+每一步合法输入都在**同一状态变换内**完成事件接纳/撤回、开放会话重组与封账：
+
+* 先对本步生效后的开放成员形成最大组件，再封账其中 `closes_at_us <= F` 的全部组件；`F = null` 不封。
+* watermark 推进可在当步封多个组件；`closes_at_us` 恰等 F 立即封账。
+* 撤回拆出的早期片段，即使本步没有推进 watermark，只要其 `closes_at_us <= F` 也必须在当步结算。
+* 桥接/合并后的会话期限完全由新组件自己的 `last_us + gap_us` 决定，**不得沿用旧短片段的封账期限**：先接受桥接再推进截止时，旧短段的旧期限不能提前封新长段。
+* 有限输入读完时不自动推进 watermark 或封账，仍开放的会话原样保留。
+
+### 7.6 变更流、快照与下游重建
+
+每个合法操作返回的 change 严格含 `step`、`status`、`retracted_session_ids`、`upserts`、`sealed_sessions`。`step` 从 1 起按**合法调用**递增，非法调用不占 step。`status` ∈ `accepted` / `late` / `duplicate` / `retracted` / `noop` / `sealed` / `watermark`；重复、迟到、已封拒绝等不修改业务状态的行仍占 step 并保留 status，其三个变更数组为空。
+
+设 B 为本步之前的开放表、A 为本步全部修改及封账之后的开放表、N 为本步新封的表：
+
+* `retracted_session_ids` 恰为 B 中 id 不在 A 也不在 N 中的旧开放身份，按 id 排序；只撤销旧开放身份，不撤销已封结果。
+* `upserts` 恰为 A 中不存在于 B、或完整快照有变化的项；本步刚拆分后仍以新快照存在的旧 id 通过 upsert 替换，不作为无关删除。
+* N 的每项都作为完整快照放入 `sealed_sessions`（即使同 id 之前在 B 中）；既有已封会话不重复发出。一个 change 不会在 upserts 与 sealed_sessions 中重复同一 id。
+* 全部 session 数组按 `(principal, route, first_us, session_id)` 排序。
+
+下游按固定次序应用即可仅靠「上一开放表 + 已封表」重建当前状态：先从开放表删除 `retracted_session_ids`；再以 `upserts` 替换或插入开放项；最后对 `sealed_sessions` 删除同 id 开放项并新增已封项。该流不泄漏未来操作，也不可能追改先前发出的 sealed 结果。每次返回的 dict 与列表都是独立拷贝，后续调用无法通过共享可变引用修改旧 change 或旧 snapshot。
+
+`snapshot()` 严格返回 `watermark_us`、`cutoff_us`、`open_sessions`、`sealed_sessions`：watermark 为空时 cutoff 也为 `null`，否则 `cutoff_us = F`；已封表为全部已封快照并按 `(principal, route, first_us, session_id)` 排序（不是封账到达顺序）。`sessions_analyze(data)` 返回 snapshot 的四个字段再加 `trace`（每项即逐步 `apply` 的 change），严格按 `operations` 原次序调用同一语义并收集轨迹：**不能把输入先按事件时间重排再输出轨迹，第 k 步也不能使用后续操作**。空 operations 给出 null 边界、空 trace 与空会话数组。
+
+### 7.7 错误、CLI 发布与兼容
+
+构造 `SessionAccumulator` 时即校验 policies 与迟到配置；每个 `apply` 先完成本步全部校验与计算再提交，任一输入错误不留下规范身份登记、watermark、step、开放或已封会话的半步变更。CLI 外层严格为 `schema_version=5`、`mode="sessions"`、`source_sha256`、`result`；全部合法业务状态退出 0 且 stdout 与保存文件为同一 JSON；任何操作非法则整个 CLI 退出 2、只写 stderr、不打印成功 JSON，旧目标文件保留（不保存前半段轨迹）。继续复用 8MB 受限 JSON、重复键/非有限数值拒绝、同文件与硬链接别名及输出符号链接拒绝、原子保存；`source_sha256` 始终反映原始字节，operations 的业务顺序是语义的一部分。既有 `audit`(v1)/`retention`(v2)/`reconcile`(v3)/`chargeback`(v4) 四种模式及独立台账、事实仓契约保持不变。
+
+### 7.8 验收与测试要点
+
+* 取 gap=6s、allowed_lateness=2s，同 scope 事件 a@0s(1)、b@5s(2)、c@10s(3) 形成一个会话；watermark 到 10s 后撤回 b，须在该撤回步把 a(units=1, closes_at=6s) 封账、把 c(units=3, closes_at=16s) 留开放；随后 7s 新事件判迟到且不能重开 a，b 的完全相同重试判 duplicate 且不能复活。
+* 两种关键次序：先接受桥接再推进截止时，原短段旧期限不能提前封新长段；先封独立早段再到达能在全量历史上连接它的迟到事件时，封账快照不变。gap 恰等边界断开、F 恰等边界的新事件接纳、closes_at 恰等 F 立即封账。
+* 测试用手算预期逐步核对 trace，并用仅消费 change 的独立下游重建开放表与已封表，与每一步 snapshot 比对；预期不调用被测构造器生成，另以独立暴力参考引擎做随机差分。覆盖同时间多 id、最小 id 删除更名、多 scope、撤回拆两段且只封早段、最后成员撤回、旧 event 在撤回/封账/late 后的相同重试、等价时区与冲突 id、负 epoch 及微秒、watermark 相等及倒退、非法 apply 后继续合法输入、返回对象不被后续调用修改，并实跑 CLI 及错误保留旧报告，沿用原业务测试检查回归。

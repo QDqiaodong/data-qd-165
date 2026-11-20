@@ -1,0 +1,21 @@
+{
+  "policies": [
+    {"principal": "acme", "route": "/records", "gap_seconds": 6},
+    {"principal": "globex", "route": "/search", "gap_seconds": 2}
+  ],
+  "allowed_lateness_seconds": 2,
+  "operations": [
+    {"kind": "event", "id": "c", "principal": "acme", "route": "/records", "at": "2026-03-01T00:00:10Z", "units": 3},
+    {"kind": "event", "id": "a", "principal": "acme", "route": "/records", "at": "2026-03-01T00:00:00Z", "units": 1},
+    {"kind": "event", "id": "b", "principal": "acme", "route": "/records", "at": "2026-03-01T00:00:05Z", "units": 2},
+    {"kind": "event", "id": "s1", "principal": "globex", "route": "/search", "at": "2026-03-01T00:00:00Z", "units": 4},
+    {"kind": "event", "id": "s2", "principal": "globex", "route": "/search", "at": "2026-03-01T00:00:05Z", "units": 5},
+    {"kind": "event", "id": "a", "principal": "acme", "route": "/records", "at": "2026-03-01T00:00:00Z", "units": 1},
+    {"kind": "watermark", "at": "2026-03-01T00:00:10Z"},
+    {"kind": "retract", "event_id": "b"},
+    {"kind": "event", "id": "late1", "principal": "acme", "route": "/records", "at": "2026-03-01T00:00:07Z", "units": 9},
+    {"kind": "retract", "event_id": "b"},
+    {"kind": "watermark", "at": "2026-03-01T00:00:10Z"},
+    {"kind": "retract", "event_id": "s1"}
+  ]
+}
